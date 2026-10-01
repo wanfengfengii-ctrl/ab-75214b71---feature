@@ -29,7 +29,13 @@
 预算，高代价路径不可能进入全局最优解。滑移预算 <= 6，同一层接收游标满足
 ``|i-j| <= cost``，状态空间有界。
 
-CRC-8：多项式 x^8+x^2+x+1（0x07），初值 0，最高位优先。
+业务约束
+--------
+固定长度模式下所有帧等长；启用**帧内长度**（``intra_frame_length``）后，
+每帧结构为 ``同步字 | 6 位长度码 | 载荷余部 | CRC8``，长度码按无符号大端
+编码"总载荷长度 - 16"，仅 0..32 有效（载荷 16..48 位）。帧的真实长度须
+在收到长度码后才确定，求解器在同一条接收流上联合恢复长度码、帧边界、
+载荷、CRC 与滑移；长度码越界（33..63）的候选不得成帧。
 """
 
 from __future__ import annotations
@@ -47,6 +53,10 @@ PAYLOAD_MAX_LEN = 48
 SLIPPAGE_MAX_LIMIT = 6
 CRC_LEN = 8
 CRC_POLY = 0x07  # x^8 + x^2 + x + 1，省略最高项 x^8
+# 帧内长度模式：每帧载荷前 6 位为无符号大端长度码 = 总载荷长度 - 16，
+# 即合法码 0..32 对应载荷 16..48 位；33..63 越界，不得成帧。
+LENGTH_FIELD_LEN = 6
+LENGTH_CODE_MAX = PAYLOAD_MAX_LEN - PAYLOAD_MIN_LEN  # 32
 
 # 不同校正串数量的截断表示：1 = 唯一，2 = 多个（唯一性判定只需布尔）。
 MULTIPLE = 2
@@ -93,10 +103,16 @@ class FrameResult:
     payload: str
     crc: str
     raw: str
+    payload_length: int | None = None
+    length_field: str | None = None
 
     def to_dict(self) -> dict:
-        return {"index": self.index, "payload": self.payload,
-                "crc": self.crc, "raw": self.raw}
+        out = {"index": self.index, "payload": self.payload,
+               "crc": self.crc, "raw": self.raw}
+        if self.length_field is not None:
+            out["payload_length"] = self.payload_length
+            out["length_field"] = self.length_field
+        return out
 
 
 @dataclass(frozen=True)
@@ -152,32 +168,46 @@ class ReconstructionResult:
         }
 
 
-def reconstruct(received: str, frame_count: int, sync: str, payload_len: int,
-                max_slippage: int) -> ReconstructionResult:
-    """在整条接收流上联合复原 ``frame_count`` 个等长帧。
+def reconstruct(received: str, frame_count: int, sync: str, payload_len: int | None,
+                max_slippage: int,
+                intra_frame_length: bool = False) -> ReconstructionResult:
+    """在整条接收流上联合复原 ``frame_count`` 个帧。
+
+    ``intra_frame_length`` 为假时所有帧等长（``payload_len`` 必填）；为真时
+    每帧载荷长度由该帧前 6 位长度码决定（``payload_len`` 应为 None）。
 
     滑移预算从 0 逐档放宽：第一档存在完整帧流时，该档代价即为全局最小
     滑移次数（无滑移档只有唯一的匹配路径，求解极快）。
     """
-    sync_len = len(sync)
-    frame_len = sync_len + payload_len + CRC_LEN
-    total_len = frame_count * frame_len
     n = len(received)
-    delta = n - total_len  # 全局 插入数 - 漏失数
     rb = [ord(c) - ord("0") for c in received]
     sb = [ord(c) - ord("0") for c in sync]
 
+    if intra_frame_length:
+        runner = lambda budget: _run_budget_variable(
+            rb, sb, frame_count, n, budget)
+        split_args = (True, None, None)
+        # 变长模式无先验总长度，delta 剪枝不适用；下界只反映预算+1。
+        lower_bound = max_slippage + 1
+    else:
+        frame_len = len(sync) + payload_len + CRC_LEN
+        total_len = frame_count * frame_len
+        delta = n - total_len  # 全局 插入数 - 漏失数
+        runner = lambda budget: _run_budget(
+            rb, sb, frame_count, frame_len, n, delta, budget)
+        split_args = (False, payload_len, frame_len)
+        lower_bound = max(max_slippage + 1, abs(delta))
+
     for budget in range(0, max_slippage + 1):
-        answer = _run_budget(rb, sb, frame_count, frame_len, n, delta,
-                             budget)
+        answer = runner(budget)
         if answer is not None:
             best_cost, finals = answer
             tied = [(rep, count) for i, (c, rep, count) in finals.items()
                     if i == n and c == best_cost]
             corrected = min(rep for rep, _ in tied)
             unique = len(tied) == 1 and tied[0][1] == 1
-            frames, events = _split_frames(corrected, received, sync,
-                                           payload_len, frame_len)
+            frames, events = _split_frames(
+                corrected, received, sync, *split_args)
             return ReconstructionResult(
                 recoverable=True, corrected=corrected, frames=tuple(frames),
                 slippage_count=best_cost, events=tuple(events),
@@ -185,7 +215,6 @@ def reconstruct(received: str, frame_count: int, sync: str, payload_len: int,
                 minimum_slippage_lower_bound=None, budget=max_slippage,
             )
 
-    lower_bound = max(max_slippage + 1, abs(delta))
     return ReconstructionResult(
         recoverable=False, corrected=None, frames=(),
         slippage_count=0, events=(), unique=False, alternatives=0,
@@ -251,6 +280,143 @@ def _run_budget(rb, sb, frame_count, frame_len, n, delta, budget):
     if best_cost is None:
         return None
     return best_cost, finals
+
+
+def _run_budget_variable(rb, sb, frame_count, n, budget):
+    """帧内长度模式下的分层帧 DP。
+
+    每帧发送侧依次为：同步字（定长）→ 6 位无符号大端长度码 →
+    载荷余部（位数由码决定）→ 8 位 CRC。帧内状态键为
+    ``(i, cost, reg, code)``：code 在同步字阶段为 None，长度码移入期间
+    累积为 0..63，码越界（>32）的状态直接丢弃；不同长度码的状态绝不合并，
+    只有帧边界（reg 归零）处才按接收游标折叠。
+    """
+    sync_len = len(sb)
+    frame_min = sync_len + PAYLOAD_MIN_LEN + CRC_LEN       # S + 24
+    frame_max = sync_len + PAYLOAD_MAX_LEN + CRC_LEN       # S + 56
+    # 帧边界状态：{i: (代价, 代表校正串, 不同串标志)}
+    boundary: dict[int, tuple[int, str, int]] = {0: (0, "", 1)}
+    finals: dict[int, tuple[int, str, int]] = {}
+
+    def prune(cur, rem_lo, rem_hi, rem_after):
+        """后缀可行性剪枝。
+
+        本帧剩余发送位数 ∈ [rem_lo, rem_hi]（消费后口径），其后还有
+        rem_after 个整帧（每个 Fmin..Fmax 位）。令 d = 剩余接收位数、
+        S = 剩余发送位数，则后缀至少需要 |d-S| 次滑移；超过剩余预算的
+        状态直接丢弃。
+        """
+        lo = rem_lo + rem_after * frame_min
+        hi = rem_hi + rem_after * frame_max
+        out = {}
+        for key, val in cur.items():
+            i, cost = key[0], key[1]
+            d = n - i
+            need = lo - d if d < lo else (d - hi if d > hi else 0)
+            if need <= budget - cost:
+                out[key] = val
+        return out
+
+    def advance(cur, expected, rem_lo, rem_hi, rem_after, code_bit=False):
+        """推进一个发送位；rem_* 为消费前的剩余位数，消费后减一。"""
+        cur = _insertion_closure_any(cur, n, budget)
+        nxt: dict[tuple, tuple[int, str]] = {}
+        for key, (count, rep) in cur.items():
+            i, cost, reg, code = key
+            if i < n:
+                b = rb[i]
+                if expected is None or b == expected:
+                    nc_code = ((code or 0) << 1 | b) if code_bit else code
+                    nkey = (i + 1, cost, _crc_step(reg, b), nc_code)
+                    _merge(nxt, nkey, count, rep + str(b))
+            if cost < budget:
+                candidates = ((expected,) if expected is not None
+                              else (0, 1))
+                for b in candidates:
+                    nc_code = ((code or 0) << 1 | b) if code_bit else code
+                    nkey = (i, cost + 1, _crc_step(reg, b), nc_code)
+                    _merge(nxt, nkey, count, rep + str(b))
+        return prune(nxt, rem_lo - 1, rem_hi - 1, rem_after)
+
+    for k in range(frame_count):
+        if not boundary:
+            return None
+        rem_after = frame_count - 1 - k
+        cur: dict[tuple, tuple[int, str]] = {
+            (i, cost, 0, None): (count, rep)
+            for i, (cost, rep, count) in boundary.items()
+        }
+
+        # 1) 同步字：位值固定
+        for j in range(sync_len):
+            cur = advance(cur, sb[j],
+                          rem_lo=frame_min - j, rem_hi=frame_max - j,
+                          rem_after=rem_after)
+
+        # 2) 6 位长度码（大端，位值自由，码值累积）
+        for c in range(LENGTH_FIELD_LEN):
+            consumed = sync_len + c
+            cur = advance(cur, None,
+                          rem_lo=frame_min - consumed,
+                          rem_hi=frame_max - consumed,
+                          rem_after=rem_after, code_bit=True)
+
+        # 3) 按码分组：越界码不得成帧；合法码继续推进载荷余部与 CRC
+        completed: dict[tuple, tuple[int, str]] = {}
+        groups: dict[int, dict[tuple, tuple[int, str]]] = {}
+        for key, val in cur.items():
+            code = key[3]
+            if code is not None and code <= LENGTH_CODE_MAX:
+                groups.setdefault(code, {})[key] = val
+        for code, states in groups.items():
+            payload_len = PAYLOAD_MIN_LEN + code
+            frame_len_code = sync_len + payload_len + CRC_LEN
+            rest = (payload_len - LENGTH_FIELD_LEN) + CRC_LEN  # 载荷余部+CRC
+            g = states
+            for q in range(rest):
+                consumed = sync_len + LENGTH_FIELD_LEN + q
+                # 码已定，本帧发送总长固定：剩余位数用真实帧长
+                g = advance(g, None,
+                            rem_lo=frame_len_code - consumed,
+                            rem_hi=frame_len_code - consumed,
+                            rem_after=rem_after)
+            completed.update(g)
+
+        # 4) 插入闭包 + CRC 余数归零，折叠到帧边界
+        completed = _insertion_closure_any(completed, n, budget)
+        folded: dict[int, tuple[int, str, int]] = {}
+        for key, (count, rep) in completed.items():
+            i, cost, reg, _code = key
+            if reg != 0:
+                continue
+            _fold(folded, i, cost, rep, count)
+
+        if k == frame_count - 1:
+            for i, v in folded.items():
+                _fold(finals, i, *v)
+        boundary = folded
+
+    best_cost = min((c for i, (c, _, _) in finals.items() if i == n),
+                    default=None)
+    if best_cost is None:
+        return None
+    return best_cost, finals
+
+
+def _insertion_closure_any(cur, n, budget):
+    """变长 DP 的插入闭包：状态键前两位固定为 (i, cost)，其余透传。"""
+    out = dict(cur)
+    queue = deque(out.keys())
+    while queue:
+        key = queue.popleft()
+        i, cost = key[0], key[1]
+        if i >= n or cost >= budget:
+            continue
+        count, rep = out[key]
+        nkey = (i + 1, cost + 1) + tuple(key[2:])
+        if _merge(out, nkey, count, rep):
+            queue.append(nkey)
+    return out
 
 
 def _feasible(i, cost, sent_done, delta, budget):
@@ -321,9 +487,13 @@ def _fold(table, i, cost, rep, count):
         table[i] = (cost, min(rep, ore), ncount)
 
 
-def _split_frames(corrected: str, received: str, sync: str, payload_len: int,
-                  frame_len: int):
+def _split_frames(corrected: str, received: str, sync: str,
+                  intra_frame_length: bool, payload_len: int | None = None,
+                  frame_len: int | None = None):
     """切分校正串为逐帧结果，并用最小编辑对齐求插入/漏失事件位置。
+
+    ``intra_frame_length`` 为假时帧等长（``frame_len``/``payload_len``
+    指定）；为真时每帧长度由该帧 6 位长度码解码得到，帧长可逐帧不同。
 
     位置基于校正串（发送侧）0 计位：
 
@@ -336,14 +506,36 @@ def _split_frames(corrected: str, received: str, sync: str, payload_len: int,
     """
     sync_len = len(sync)
     frames = []
-    for k in range(0, len(corrected), frame_len):
-        raw = corrected[k:k + frame_len]
+    # 逐帧切分边界（变长模式由长度码决定帧长），同时建立 发送位 -> (帧,帧内偏移)
+    frame_of_pos: list[tuple[int | None, int | None]] = [
+        (None, None)] * len(corrected)
+    starts: list[int] = []
+    pos = 0
+    idx = 0
+    while pos < len(corrected):
+        starts.append(pos)
+        if intra_frame_length:
+            length_field = corrected[pos + sync_len:
+                                     pos + sync_len + LENGTH_FIELD_LEN]
+            plen = PAYLOAD_MIN_LEN + int(length_field, 2)
+            flen = sync_len + plen + CRC_LEN
+        else:
+            plen = payload_len
+            flen = frame_len
+            length_field = None
+        raw = corrected[pos:pos + flen]
         frames.append(FrameResult(
-            index=k // frame_len,
-            payload=raw[sync_len:sync_len + payload_len],
+            index=idx,
+            payload=raw[sync_len:sync_len + plen],
             crc=raw[-CRC_LEN:],
             raw=raw,
+            payload_length=plen if intra_frame_length else None,
+            length_field=length_field,
         ))
+        for off in range(flen):
+            frame_of_pos[pos + off] = (idx, off)
+        pos += flen
+        idx += 1
 
     n, m = len(received), len(corrected)
     INF = 10 ** 9
@@ -361,9 +553,9 @@ def _split_frames(corrected: str, received: str, sync: str, payload_len: int,
                 v = min(v, dp[i + 1][j + 1])
             dp[i][j] = v
 
-    def frame_of(pos):
-        if 0 <= pos < len(corrected):
-            return pos // frame_len, pos % frame_len
+    def frame_of(p):
+        if 0 <= p < len(corrected):
+            return frame_of_pos[p]
         return None, None
 
     events: list[SlipEvent] = []

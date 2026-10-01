@@ -91,6 +91,43 @@ class ValidationTests(unittest.TestCase):
                 self._ok(frame_count=bad)
             self.assertIn("frame_count", ctx.exception.fields)
 
+    def test_intra_frame_length_defaults_false(self):
+        req = self._ok()
+        self.assertFalse(req.intra_frame_length)
+        self.assertEqual(req.payload_len, 16)
+
+    def test_intra_frame_length_true_omits_payload_len(self):
+        data = {
+            "received": "010101",
+            "frame_count": 3,
+            "sync": "111000101",
+            "max_slippage": 6,
+            "intra_frame_length": True,
+        }
+        req = validate(data)
+        self.assertTrue(req.intra_frame_length)
+        self.assertIsNone(req.payload_len)
+
+    def test_intra_frame_length_with_payload_len_is_illegal_combo(self):
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(intra_frame_length=True, payload_len=16)
+        self.assertIn("payload_len", ctx.exception.fields)
+
+    def test_intra_frame_length_must_be_bool(self):
+        for bad in ("true", 1, 0, "yes", None):
+            with self.assertRaises(ValidationError) as ctx:
+                validate({
+                    "received": "010101", "frame_count": 3,
+                    "sync": "111000101", "payload_len": 16,
+                    "max_slippage": 6, "intra_frame_length": bad,
+                })
+            self.assertIn("intra_frame_length", ctx.exception.fields)
+
+    def test_explicit_false_keeps_fixed_length(self):
+        req = self._ok(intra_frame_length=False)
+        self.assertFalse(req.intra_frame_length)
+        self.assertEqual(req.payload_len, 16)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

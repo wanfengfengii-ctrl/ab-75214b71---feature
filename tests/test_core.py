@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import (  # noqa: E402
     CRC_POLY,
+    LENGTH_FIELD_LEN,
+    PAYLOAD_MIN_LEN,
     crc8,
     frame_is_valid,
     reconstruct,
@@ -17,6 +19,13 @@ from app.core import (  # noqa: E402
 
 def make_frame(sync: str, payload: str) -> str:
     body = sync + payload
+    return body + format(crc8(body), "08b")
+
+
+def make_var_frame(sync: str, plen: int, remainder: str) -> str:
+    """帧内长度模式整帧：同步字 | 6 位长度码 | 载荷余部 | CRC。"""
+    assert len(remainder) == plen - LENGTH_FIELD_LEN
+    body = sync + format(plen - PAYLOAD_MIN_LEN, "06b") + remainder
     return body + format(crc8(body), "08b")
 
 
@@ -309,6 +318,201 @@ class BoundaryRangeTests(unittest.TestCase):
             self.assertEqual(r.corrected, stream)
             self.assertEqual(r.events[0].kind, "insertion")
             self.assertEqual(r.events[0].position, pos)
+
+
+class VariableLengthTests(unittest.TestCase):
+    """帧内长度（自适应压缩）模式。"""
+
+    def setUp(self):
+        self.rng = random.Random(505)
+        self.sync = "10101011"
+        self.plens = [16, 30, 48]  # 三帧长度各异（含上下界）
+        rems = []
+        for pl in self.plens:
+            # 载荷余部内嵌伪同步字
+            rem = ("".join(self.rng.choice("01")
+                           for _ in range(pl - LENGTH_FIELD_LEN
+                                          - len(self.sync)))
+                   + self.sync)
+            rems.append(rem)
+        self.rems = rems
+        self.frames = [make_var_frame(self.sync, pl, rem)
+                       for pl, rem in zip(self.plens, rems)]
+        self.stream = "".join(self.frames)
+
+    def _reconstruct(self, received, budget=6):
+        return reconstruct(received, len(self.plens), self.sync, None,
+                           budget, intra_frame_length=True)
+
+    def test_clean_variable_stream(self):
+        r = self._reconstruct(self.stream)
+        self.assertTrue(r.recoverable)
+        self.assertEqual(r.slippage_count, 0)
+        self.assertTrue(r.unique)
+        self.assertEqual(r.corrected, self.stream)
+        self.assertEqual([f.payload_length for f in r.frames], self.plens)
+        for f, pl in zip(r.frames, self.plens):
+            self.assertEqual(f.length_field,
+                             format(pl - PAYLOAD_MIN_LEN, "06b"))
+            self.assertEqual(len(f.payload), pl)
+            self.assertTrue(f.raw.startswith(self.sync))
+            self.assertEqual(f.crc, f.raw[-8:])
+            self.assertEqual(crc8(f.raw[:-8]), int(f.crc, 2))
+
+    def test_deletion_inside_length_field_recovers_all_boundaries(self):
+        # 验收场景：长度字段遭一次漏失；逐帧真实长度/边界仍须全部恢复
+        lf_start = len(self.sync)
+        # 选长度字段内与后继位不同的位置，使正向对齐把事件唯一锚定在
+        # 长度码窗口内（同值游程中的位置不可区分属既定约定）。
+        candidates = [lf_start + q for q in range(LENGTH_FIELD_LEN)
+                      if self.stream[lf_start + q]
+                      != self.stream[lf_start + q + 1]]
+        del_pos = candidates[0] if candidates else lf_start
+        anchored = bool(candidates)
+        damaged = self.stream[:del_pos] + self.stream[del_pos + 1:]
+        r = self._reconstruct(damaged)
+        self.assertTrue(r.recoverable, r)
+        self.assertEqual(r.slippage_count, 1)
+        self.assertEqual(r.corrected, self.stream)
+        self.assertEqual([f.payload_length for f in r.frames], self.plens)
+        self.assertEqual(
+            [f.length_field for f in r.frames],
+            [format(pl - PAYLOAD_MIN_LEN, "06b") for pl in self.plens])
+        ev = r.events[0]
+        self.assertEqual(ev.kind, "deletion")
+        self.assertEqual(ev.frame_index, 0)
+        if anchored:
+            self.assertGreaterEqual(ev.offset, lf_start)
+            self.assertLess(ev.offset, lf_start + LENGTH_FIELD_LEN)
+        # 位置基于校正串；按事件回放必须逐位得到接收串
+        s = r.corrected
+        for e in sorted(r.events, key=lambda x: x.position, reverse=True):
+            s = s[:e.position] + s[e.position + 1:]
+        self.assertEqual(s, damaged)
+
+    def test_insertion_replay_consistent(self):
+        pos = 40
+        damaged = self.stream[:pos] + "1" + self.stream[pos:]
+        r = self._reconstruct(damaged)
+        self.assertTrue(r.recoverable)
+        self.assertEqual(r.slippage_count, 1)
+        self.assertEqual(r.corrected, self.stream)
+        s = r.corrected
+        for e in sorted(r.events, key=lambda x: x.position, reverse=True):
+            s = s[:e.position] + e.bit + s[e.position:]
+        self.assertEqual(s, damaged)
+
+    def test_out_of_range_length_code_cannot_frame(self):
+        # 码值 40（>32）：即使 CRC 合法也不得成帧
+        body = self.sync + format(40, "06b") + "0" * 50
+        bad = (body + format(crc8(body), "08b")) * 3
+        r = self._reconstruct(bad)
+        self.assertFalse(r.recoverable)
+        self.assertEqual(r.frames, ())
+        self.assertEqual(r.minimum_slippage_lower_bound, 7)
+
+    def test_over_budget_at_max_length(self):
+        # 帧均为最大长度 48，无法再变长吸收；尾部 7 个插入 => 下界 >= 7
+        frame = make_var_frame(self.sync, 48, "1" * 42)
+        stream = frame * 3
+        r = self._reconstruct(stream + "1010101")
+        self.assertFalse(r.recoverable)
+        self.assertGreaterEqual(r.minimum_slippage_lower_bound, 7)
+
+    def test_mixed_lengths_min_and_max(self):
+        rng = random.Random(9)
+        for plens in ([16, 16, 16], [48, 48, 48], [16, 48, 24]):
+            stream = "".join(
+                make_var_frame(self.sync, pl,
+                               "".join(rng.choice("01")
+                                       for _ in range(pl - LENGTH_FIELD_LEN)))
+                for pl in plens)
+            r = self._reconstruct(stream)
+            self.assertTrue(r.recoverable, plens)
+            self.assertEqual([f.payload_length for f in r.frames], plens)
+            self.assertEqual(r.corrected, stream)
+
+    def test_variable_matches_brute_force(self):
+        """与朴素穷举对拍：最小滑移、字典序最小、唯一性（变长帧）。"""
+        def brute(sync, recv, nf, budget):
+            sl = len(sync)
+            found = set()
+
+            def step(reg, b):
+                v = reg ^ (b << 7)
+                return (((v << 1) ^ 0x07) & 0xFF
+                        if v & 0x80 else ((v << 1) & 0xFF))
+
+            def rec(ri, k, j, code, flen, reg, corr, cost):
+                if cost > budget:
+                    return
+                if k == nf:
+                    if ri == len(recv):
+                        found.add(corr)
+                    return
+                if flen != -1 and j == flen:
+                    if reg == 0:
+                        rec(ri, k + 1, 0, -1, -1, 0, corr, cost)
+                    return
+                is_code = sl <= j < sl + LENGTH_FIELD_LEN
+                cands = ((int(sync[j]),) if j < sl else (0, 1))
+                for b in cands:
+                    ncode, nflen = code, flen
+                    if is_code:
+                        ncode = (code if code != -1 else 0) * 2 + b
+                        if j - sl == LENGTH_FIELD_LEN - 1:
+                            if ncode > 32:
+                                continue  # 越界码不成帧
+                            nflen = sl + 16 + ncode + 8
+                    elif flen == -1 and j >= sl + LENGTH_FIELD_LEN:
+                        continue
+                    if ri < len(recv) and int(recv[ri]) == b:
+                        rec(ri + 1, k, j + 1, ncode, nflen,
+                            step(reg, b), corr + str(b), cost)
+                    rec(ri, k, j + 1, ncode, nflen,
+                        step(reg, b), corr + str(b), cost + 1)
+                if ri < len(recv):
+                    rec(ri + 1, k, j, code, flen, reg, corr, cost + 1)
+
+            rec(0, 0, 0, -1, -1, 0, "", 0)
+            return found
+
+        rng = random.Random(3210)
+        checked = 0
+        for _ in range(40):
+            slen = rng.randint(6, 8)
+            sync = "".join(rng.choice("01") for _ in range(slen))
+            nf = 3
+            stream = ""
+            for _ in range(nf):
+                pl = rng.randint(16, 24)
+                stream += make_var_frame(
+                    sync, pl,
+                    "".join(rng.choice("01")
+                            for _ in range(pl - LENGTH_FIELD_LEN)))
+            damaged = stream
+            for _ in range(rng.randint(0, 2)):
+                p = rng.randrange(len(damaged))
+                if rng.random() < 0.5:
+                    damaged = damaged[:p] + damaged[p + 1:]
+                else:
+                    damaged = damaged[:p] + rng.choice("01") + damaged[p:]
+            budget = rng.randint(0, 2)
+            r = reconstruct(damaged, nf, sync, None, budget,
+                            intra_frame_length=True)
+            opt = brute(sync, damaged, nf, budget)
+            if not opt:
+                self.assertFalse(r.recoverable)
+                continue
+            costs = {x: edit_distance_ins_del(damaged, x) for x in opt}
+            best_cost = min(costs.values())
+            best = {x for x, c in costs.items() if c == best_cost}
+            self.assertTrue(r.recoverable)
+            self.assertEqual(r.slippage_count, best_cost)
+            self.assertEqual(r.corrected, min(best))
+            self.assertEqual(r.unique, len(best) == 1)
+            checked += 1
+        self.assertGreater(checked, 15)
 
 
 if __name__ == "__main__":

@@ -201,6 +201,96 @@ def smoke() -> bool:
                 body.get("fields", {})):
             ok = False
             print("  FAIL：应给出全部问题字段的明确错误")
+
+        # 6) 变长帧冒烟：三帧长度各异、长度字段遭一次漏失、载荷含伪同步字
+        sync_v = "10101011"
+        plens_v = [16, 31, 48]
+
+        def var_frame(plen, remainder):
+            assert len(remainder) == plen - 6
+            b = sync_v + format(plen - 16, "06b") + remainder
+            return b + format(crc8(b), "08b")
+
+        vframes = []
+        for fi, pl in enumerate(plens_v):
+            rem = "".join(rng.choice("01")
+                          for _ in range(pl - 6 - len(sync_v)))
+            if fi == 0:
+                rem = "1" + rem[1:]  # 紧随长度码 000000 之后置 1，锚定删除位
+            rem = rem + sync_v       # 载荷余部内嵌伪同步字
+            vframes.append(var_frame(pl, rem))
+        vstream = "".join(vframes)
+        lf0 = len(sync_v)
+        vdel = lf0 + 5  # 删除第一帧长度码末位（0），其后继位为 1
+        vdamaged = vstream[:vdel] + vstream[vdel + 1:]
+        status, body = post("/api/v1/recover", {
+            "received": vdamaged, "frame_count": 3, "sync": sync_v,
+            "max_slippage": 6, "intra_frame_length": True,
+        })
+        print(f"  POST /api/v1/recover (变长帧) -> {status}, "
+              f"slippage={body.get('slippage_count')}")
+        if status != 200 or not body.get("recoverable"):
+            ok = False
+            print("  FAIL：变长帧流应在预算内可复原")
+        else:
+            if body.get("corrected") != vstream:
+                ok = False
+                print("  FAIL：校正串与发送流不一致")
+            if body.get("slippage_count") != 1:
+                ok = False
+                print("  FAIL：长度字段一次漏失应计 1 次滑移")
+            got_lens = [f.get("payload_length") for f in body["frames"]]
+            got_lf = [f.get("length_field") for f in body["frames"]]
+            if got_lens != plens_v:
+                ok = False
+                print(f"  FAIL：逐帧长度应为 {plens_v}，实际 {got_lens}")
+            if got_lf != [format(p - 16, "06b") for p in plens_v]:
+                ok = False
+                print(f"  FAIL：长度字段应为 {got_lf}")
+            ev0 = body["events"][0]
+            if not (ev0["kind"] == "deletion"
+                    and ev0["frame_index"] == 0
+                    and lf0 <= ev0["offset"] < lf0 + 6):
+                ok = False
+                print(f"  FAIL：事件应落在首帧长度字段内，实际 {ev0}")
+            # 回放与接收串一致
+            rebuilt = body["corrected"]
+            for ev in sorted(body["events"], key=lambda e: e["position"],
+                            reverse=True):
+                rebuilt = (rebuilt[:ev["position"]]
+                           + rebuilt[ev["position"] + 1:])
+            if rebuilt != vdamaged:
+                ok = False
+                print("  FAIL：事件回放与接收串不一致")
+
+        # 7) 变长帧非法模式组合：启用 intra_frame_length 又给 payload_len
+        status, body = post("/api/v1/recover", {
+            "received": "01", "frame_count": 3, "sync": sync_v,
+            "payload_len": 16, "max_slippage": 6,
+            "intra_frame_length": True,
+        })
+        print(f"  POST 变长帧+payload_len 非法组合 -> {status}，"
+              f"字段: {sorted(body.get('fields', {}))}")
+        if status != 422 or "payload_len" not in body.get("fields", {}):
+            ok = False
+            print("  FAIL：应返回 payload_len 字段错误")
+
+        # 8) 变长帧越界长度码：CRC 合法也不得成帧，预算内无完整解释
+        bad_body = sync_v + format(40, "06b") + "0" * 50
+        bad_stream = (bad_body + format(crc8(bad_body), "08b")) * 3
+        status, body = post("/api/v1/recover", {
+            "received": bad_stream, "frame_count": 3, "sync": sync_v,
+            "max_slippage": 6, "intra_frame_length": True,
+        })
+        print(f"  POST 变长帧越界码 -> {status}, "
+              f"recoverable={body.get('recoverable')}, "
+              f"lower_bound={body.get('minimum_slippage_lower_bound')}")
+        if body.get("recoverable") or "frames" in body:
+            ok = False
+            print("  FAIL：越界长度码候选不得成帧")
+        if body.get("minimum_slippage_lower_bound", 0) < 7:
+            ok = False
+            print("  FAIL：应给出已验证下界 >= 7")
     except Exception:  # noqa: BLE001
         ok = False
         traceback.print_exc()

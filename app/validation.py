@@ -28,8 +28,9 @@ class RecoverRequest:
     received: str
     frame_count: int
     sync: str
-    payload_len: int
+    payload_len: int | None
     max_slippage: int
+    intra_frame_length: bool
 
 
 def _is_int(value) -> bool:
@@ -79,11 +80,25 @@ def validate(data: object) -> RecoverRequest:
     elif not (SYNC_MIN_LEN <= len(sync) <= SYNC_MAX_LEN):
         errors["sync"] = f"长度必须在 {SYNC_MIN_LEN}..{SYNC_MAX_LEN} 位之间"
 
-    # payload_len
+    # intra_frame_length（可选布尔，默认关闭；关闭时维持固定长度行为）
+    ifl = data.get("intra_frame_length", False)
+    if not isinstance(ifl, bool):
+        errors["intra_frame_length"] = "必须是布尔值 true/false"
+        ifl = False
+
+    # payload_len：固定长度模式必填；帧内长度模式下长度逐帧由长度码决定，
+    # 显式给出 payload_len 属于非法模式组合。
     pl = data.get("payload_len")
-    if "payload_len" not in data or pl is None:
+    if ifl:
+        if "payload_len" in data and pl is not None:
+            errors["payload_len"] = (
+                "启用帧内长度（intra_frame_length=true）时不得指定 "
+                "payload_len：每帧长度由其 6 位长度码决定")
+        pl = None
+    elif "payload_len" not in data or pl is None:
         errors["payload_len"] = (
-            f"必填：载荷长度（{PAYLOAD_MIN_LEN}..{PAYLOAD_MAX_LEN} 位）")
+            f"必填：载荷长度（{PAYLOAD_MIN_LEN}..{PAYLOAD_MAX_LEN} 位）；"
+            "或设置 intra_frame_length=true 启用帧内长度")
     elif not _is_int(pl):
         errors["payload_len"] = "必须是整数"
     elif not (PAYLOAD_MIN_LEN <= pl <= PAYLOAD_MAX_LEN):
@@ -103,4 +118,4 @@ def validate(data: object) -> RecoverRequest:
     if errors:
         raise ValidationError(errors)
 
-    return RecoverRequest(received, fc, sync, pl, ms)
+    return RecoverRequest(received, fc, sync, pl, ms, ifl)

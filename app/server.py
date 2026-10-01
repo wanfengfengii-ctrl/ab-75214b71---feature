@@ -5,6 +5,8 @@
 * ``GET  /ready``             就绪检查
 * ``GET  /``                  服务信息
 * ``POST /api/v1/recover``    提交接收比特串进行联合复原
+  （缺省固定长度模式；``in_frame_length: true`` 启用帧内长度变长帧模式，
+  此时不得携带 ``payload_len``）
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import os
 import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .core import reconstruct
+from .core import reconstruct, reconstruct_variable
 from .validation import ValidationError, validate
 
 LOG = logging.getLogger("telemetry")
@@ -88,10 +90,17 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = reconstruct(
-                req.received, req.frame_count, req.sync,
-                req.payload_len, req.max_slippage,
-            )
+            if req.in_frame_length:
+                # 帧内长度模式：载荷长度逐帧编码于载荷前六位
+                result = reconstruct_variable(
+                    req.received, req.frame_count, req.sync,
+                    req.max_slippage,
+                )
+            else:
+                result = reconstruct(
+                    req.received, req.frame_count, req.sync,
+                    req.payload_len, req.max_slippage,
+                )
         except Exception as exc:  # 防御：服务不因单个请求崩溃
             LOG.exception("reconstruction failed: %s", exc)
             self._send_json(500, {"error": "internal_error",

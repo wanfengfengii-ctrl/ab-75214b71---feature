@@ -28,8 +28,9 @@ class RecoverRequest:
     received: str
     frame_count: int
     sync: str
-    payload_len: int
+    payload_len: int | None  # 帧内长度模式下为 None（逐帧解码）
     max_slippage: int
+    in_frame_length: bool = False
 
 
 def _is_int(value) -> bool:
@@ -79,16 +80,37 @@ def validate(data: object) -> RecoverRequest:
     elif not (SYNC_MIN_LEN <= len(sync) <= SYNC_MAX_LEN):
         errors["sync"] = f"长度必须在 {SYNC_MIN_LEN}..{SYNC_MAX_LEN} 位之间"
 
-    # payload_len
+    # in_frame_length（可选布尔，缺省 false）：启用"帧内长度"变长帧模式，
+    # 每帧载荷前六位编码载荷长度；未启用时行为与既有固定长度模式一致。
+    ifl = data.get("in_frame_length")
+    in_frame_length = False
+    if "in_frame_length" in data and ifl is not None:
+        if not isinstance(ifl, bool):
+            errors["in_frame_length"] = "必须是布尔值（true 或 false）"
+        else:
+            in_frame_length = ifl
+
+    # payload_len：固定长度模式必填；帧内长度模式不得指定（逐帧解码），
+    # 两种模式组合冲突属于非法模式组合，逐字段给出错误。
     pl = data.get("payload_len")
-    if "payload_len" not in data or pl is None:
-        errors["payload_len"] = (
-            f"必填：载荷长度（{PAYLOAD_MIN_LEN}..{PAYLOAD_MAX_LEN} 位）")
-    elif not _is_int(pl):
-        errors["payload_len"] = "必须是整数"
-    elif not (PAYLOAD_MIN_LEN <= pl <= PAYLOAD_MAX_LEN):
-        errors["payload_len"] = (
-            f"必须在 {PAYLOAD_MIN_LEN}..{PAYLOAD_MAX_LEN} 之间")
+    pl_present = "payload_len" in data and pl is not None
+    if in_frame_length:
+        if pl_present:
+            errors["payload_len"] = (
+                "启用帧内长度（in_frame_length）时不得指定 payload_len，"
+                "载荷长度由每帧长度字段给出")
+            errors["in_frame_length"] = (
+                "与 payload_len 冲突：启用帧内长度时载荷长度逐帧编码于"
+                "帧内，不得同时指定固定载荷长度")
+    else:
+        if not pl_present:
+            errors["payload_len"] = (
+                f"必填：载荷长度（{PAYLOAD_MIN_LEN}..{PAYLOAD_MAX_LEN} 位）")
+        elif not _is_int(pl):
+            errors["payload_len"] = "必须是整数"
+        elif not (PAYLOAD_MIN_LEN <= pl <= PAYLOAD_MAX_LEN):
+            errors["payload_len"] = (
+                f"必须在 {PAYLOAD_MIN_LEN}..{PAYLOAD_MAX_LEN} 之间")
 
     # max_slippage
     ms = data.get("max_slippage")
@@ -103,4 +125,6 @@ def validate(data: object) -> RecoverRequest:
     if errors:
         raise ValidationError(errors)
 
-    return RecoverRequest(received, fc, sync, pl, ms)
+    return RecoverRequest(received, fc, sync,
+                          None if in_frame_length else pl, ms,
+                          in_frame_length)

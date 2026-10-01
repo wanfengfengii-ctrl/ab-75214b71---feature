@@ -91,6 +91,47 @@ class ValidationTests(unittest.TestCase):
                 self._ok(frame_count=bad)
             self.assertIn("frame_count", ctx.exception.fields)
 
+    def test_in_frame_length_defaults_to_fixed_mode(self):
+        req = self._ok()
+        self.assertFalse(req.in_frame_length)
+        self.assertEqual(req.payload_len, 16)
+
+    def test_in_frame_length_without_payload_len(self):
+        data = {
+            "received": "010101",
+            "frame_count": 3,
+            "sync": "111000101",
+            "max_slippage": 6,
+            "in_frame_length": True,
+        }
+        req = validate(data)
+        self.assertTrue(req.in_frame_length)
+        self.assertIsNone(req.payload_len)
+
+    def test_in_frame_length_conflicts_with_payload_len(self):
+        # 非法模式组合：启用帧内长度又指定固定载荷长度
+        with self.assertRaises(ValidationError) as ctx:
+            self._ok(in_frame_length=True)
+        self.assertIn("payload_len", ctx.exception.fields)
+        self.assertIn("in_frame_length", ctx.exception.fields)
+
+    def test_in_frame_length_must_be_bool(self):
+        for bad in ("true", 1, 0, {"x": 1}):
+            with self.assertRaises(ValidationError) as ctx:
+                self._ok(in_frame_length=bad)
+            self.assertIn("in_frame_length", ctx.exception.fields)
+
+    def test_in_frame_length_false_keeps_payload_required(self):
+        with self.assertRaises(ValidationError) as ctx:
+            validate({
+                "received": "010101",
+                "frame_count": 3,
+                "sync": "111000101",
+                "max_slippage": 6,
+                "in_frame_length": False,
+            })
+        self.assertIn("payload_len", ctx.exception.fields)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

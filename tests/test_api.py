@@ -11,12 +11,23 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.core import crc8  # noqa: E402
+from app.core import crc8, variable_frame_is_valid  # noqa: E402
 from app.server import create_server  # noqa: E402
 
 
 def make_frame(sync, payload):
     body = sync + payload
+    return body + format(crc8(body), "08b")
+
+
+def make_var_frame(sync, payload_len, rng, embed=None):
+    """变长帧：载荷前六位为长度字段（总载荷长度减 16）。"""
+    payload = list(format(payload_len - 16, "06b") + "".join(
+        rng.choice("01") for _ in range(payload_len - 6)))
+    if embed is not None:
+        off, bits = embed
+        payload[off:off + len(bits)] = bits
+    body = sync + "".join(payload)
     return body + format(crc8(body), "08b")
 
 
@@ -196,6 +207,90 @@ class ApiTests(unittest.TestCase):
             self.assertIn("_body", body["fields"])
         else:
             self.fail("应返回 400")
+
+    def test_recover_variable_length_frames(self):
+        """帧内长度模式：三帧长度各异、长度字段一次漏失、载荷含伪同步字。"""
+        rng = random.Random(20260930)
+        sync = "11001010"
+        plens = (18, 26, 34)
+        frames = [
+            make_var_frame(sync, plens[0], rng),
+            make_var_frame(sync, plens[1], rng, embed=(10, sync)),  # 伪同步字
+            make_var_frame(sync, plens[2], rng),
+        ]
+        stream = "".join(frames)
+        self.assertGreaterEqual(stream.count(sync), 4)  # 伪同步字已混入
+        # 帧 1 长度字段（载荷前六位）中挑一个两侧比特均不同的位漏失
+        lf_start = len(frames[0]) + len(sync)
+        pos = next(
+            p for p in range(lf_start, lf_start + 6)
+            if stream[p - 1] != stream[p] and stream[p + 1] != stream[p])
+        damaged = stream[:pos] + stream[pos + 1:]
+        status, body = self._request("/api/v1/recover", {
+            "received": damaged, "frame_count": 3, "sync": sync,
+            "max_slippage": 6, "in_frame_length": True,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"], body)
+        self.assertEqual(body["slippage_count"], 1)
+        self.assertEqual(body["corrected"], stream)
+        self.assertEqual(len(body["frames"]), 3)
+        for i, f in enumerate(body["frames"]):
+            # 全部真实边界必须恢复，逐帧解码长度与长度字段正确
+            self.assertEqual(f["raw"], frames[i])
+            self.assertEqual(f["payload_len"], plens[i])
+            self.assertEqual(f["length_field"], format(plens[i] - 16, "06b"))
+            self.assertEqual(f["length_code"], plens[i] - 16)
+            self.assertTrue(variable_frame_is_valid(f["raw"], sync))
+        ev = body["events"][0]
+        self.assertEqual(ev["kind"], "deletion")
+        self.assertEqual(ev["position"], pos)
+        self.assertEqual(ev["frame_index"], 1)
+        self.assertGreaterEqual(ev["offset"], len(sync))
+        self.assertLess(ev["offset"], len(sync) + 6)
+        # 回放：漏失位去掉后须与接收串逐位一致
+        s2 = body["corrected"]
+        for e in sorted(body["events"], key=lambda e: e["position"],
+                        reverse=True):
+            if e["kind"] == "deletion":
+                s2 = s2[:e["position"]] + s2[e["position"] + 1:]
+            else:
+                s2 = s2[:e["position"]] + e["bit"] + s2[e["position"]:]
+        self.assertEqual(s2, damaged)
+
+    def test_fixed_mode_response_has_no_length_fields(self):
+        """未启用帧内长度时响应保持既有格式：帧内不含长度解码字段。"""
+        rng = random.Random(5)
+        sync = "1101001101"
+        frames = [make_frame(sync, "".join(rng.choice("01")
+                                           for _ in range(24)))
+                  for _ in range(3)]
+        status, body = self._request("/api/v1/recover", {
+            "received": "".join(frames), "frame_count": 3, "sync": sync,
+            "payload_len": 24, "max_slippage": 6,
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["recoverable"])
+        for f in body["frames"]:
+            self.assertEqual(set(f), {"index", "payload", "crc", "raw"})
+
+    def test_in_frame_length_conflict_with_payload_len(self):
+        status, body = self._request("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": "111000101",
+            "payload_len": 16, "max_slippage": 6, "in_frame_length": True,
+        })
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"], "validation_failed")
+        self.assertIn("payload_len", body["fields"])
+        self.assertIn("in_frame_length", body["fields"])
+
+    def test_in_frame_length_type_error(self):
+        status, body = self._request("/api/v1/recover", {
+            "received": "010101", "frame_count": 3, "sync": "111000101",
+            "max_slippage": 6, "in_frame_length": "yes",
+        })
+        self.assertEqual(status, 422)
+        self.assertIn("in_frame_length", body["fields"])
 
     def test_unknown_route(self):
         status, _ = self._request("/nope", method="GET")
